@@ -1,0 +1,192 @@
+## ============================================================================
+## Stack: orquestrador (fork de evo-nexus) — Marcelo Franca PRO
+##
+## Deploy alvo:
+##   * Domínio público   : orquestrador.marcelofranca.pro (HTTPS)
+##   * Swarm manager     : 84.247.174.137
+##   * Network externa   : marcelonet (já existe e é a mesma do Traefik)
+##   * Cert resolver     : letsencryptresolver (HTTP-01 challenge no entrypoint web)
+##   * Entrypoint público: websecure (Traefik faz redirect web → websecure)
+##
+## Como subir:
+##   docker stack deploy -c stack.orquestrador.yml orquestrador
+##
+## Ou no Portainer:
+##   Stacks → Add stack → Web editor → cole este arquivo → Deploy.
+##
+## Imagens públicas: evoapicloud/evo-nexus-{dashboard,runtime}:latest
+## Para usar a sua build customizada (fork), troque os `image:` abaixo.
+## ============================================================================
+version: "3.8"
+
+# Trecho reaproveitado pelos serviços de runtime (telegram + scheduler).
+x-runtime-base: &runtime-base
+  image: evoapicloud/evo-nexus-runtime:latest
+  init: true
+  networks:
+    - marcelonet
+  environment:
+    - TZ=America/Sao_Paulo
+    # O entrypoint faz polling até a key aparecer no .env (configurado pelo
+    # dashboard no primeiro boot). Não há crash-loop durante o onboarding.
+    - REQUIRE_ANTHROPIC_KEY=1
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Dashboard (Flask + SPA)  → 8080
+  # Terminal  (Node PTY+WS)  → 32352  (exposto via prefixo /terminal)
+  # Único serviço com Traefik habilitado.
+  # ---------------------------------------------------------------------------
+  evonexus_dashboard:
+    image: evoapicloud/evo-nexus-dashboard:latest
+    init: true
+    networks:
+      - marcelonet
+    volumes:
+      - evonexus_config:/workspace/config
+      - evonexus_workspace:/workspace/workspace
+      - evonexus_dashboard_data:/workspace/dashboard/data
+      - evonexus_memory:/workspace/memory
+      - evonexus_adw_logs:/workspace/ADWs/logs
+      - evonexus_agent_memory:/workspace/.claude/agent-memory
+      - evonexus_claude_auth:/root/.claude
+      - evonexus_codex_auth:/root/.codex
+    environment:
+      - TZ=America/Sao_Paulo
+      - EVONEXUS_PORT=8080
+      - TERMINAL_SERVER_PORT=32352
+      - FORWARDED_ALLOW_IPS=*
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1024M
+      restart_policy:
+        condition: any
+        delay: 5s
+        max_attempts: 0
+      update_config:
+        order: stop-first
+        parallelism: 1
+        delay: 10s
+        failure_action: rollback
+      labels:
+        - traefik.enable=true
+        # Dois nomes de label porque a sua Traefik usa providers.docker E
+        # providers.swarm simultaneamente — manter ambos é o jeito mais
+        # robusto independente de qual provider for o resolvedor final.
+        - traefik.docker.network=marcelonet
+        - traefik.swarm.network=marcelonet
+
+        # ─────── Router 1: Dashboard (porta 8080) ───────
+        - traefik.http.routers.evonexus_dashboard.rule=Host(`orquestrador.marcelofranca.pro`)
+        - traefik.http.routers.evonexus_dashboard.entrypoints=websecure
+        - traefik.http.routers.evonexus_dashboard.priority=1
+        - traefik.http.routers.evonexus_dashboard.tls=true
+        - traefik.http.routers.evonexus_dashboard.tls.certresolver=letsencryptresolver
+        - traefik.http.routers.evonexus_dashboard.service=evonexus_dashboard
+        - traefik.http.services.evonexus_dashboard.loadbalancer.server.port=8080
+        - traefik.http.services.evonexus_dashboard.loadbalancer.passhostheader=true
+
+        # ─────── Router 2: Terminal /terminal (porta 32352, WebSocket) ───────
+        # Priority 10 > 1 garante que /terminal/* vence o router do dashboard.
+        # stripprefix remove /terminal antes de mandar pro PTY (que serve / no root).
+        - traefik.http.routers.evonexus_terminal.rule=Host(`orquestrador.marcelofranca.pro`) && PathPrefix(`/terminal`)
+        - traefik.http.routers.evonexus_terminal.entrypoints=websecure
+        - traefik.http.routers.evonexus_terminal.priority=10
+        - traefik.http.routers.evonexus_terminal.tls=true
+        - traefik.http.routers.evonexus_terminal.tls.certresolver=letsencryptresolver
+        - traefik.http.routers.evonexus_terminal.service=evonexus_terminal
+        - traefik.http.routers.evonexus_terminal.middlewares=evonexus_terminal_strip
+        - traefik.http.middlewares.evonexus_terminal_strip.stripprefix.prefixes=/terminal
+        - traefik.http.services.evonexus_terminal.loadbalancer.server.port=32352
+        - traefik.http.services.evonexus_terminal.loadbalancer.passhostheader=true
+
+  # ---------------------------------------------------------------------------
+  # Telegram bot (claude --channels plugin:telegram@...)
+  # ---------------------------------------------------------------------------
+  evonexus_telegram:
+    <<: *runtime-base
+    command:
+      - "claude"
+      - "--channels"
+      - "plugin:telegram@claude-plugins-official"
+      - "--dangerously-skip-permissions"
+    stdin_open: true
+    tty: true
+    volumes:
+      - evonexus_config:/workspace/config
+      - evonexus_workspace:/workspace/workspace
+      - evonexus_memory:/workspace/memory
+      - evonexus_adw_logs:/workspace/ADWs/logs
+      - evonexus_agent_memory:/workspace/.claude/agent-memory
+      - evonexus_claude_auth:/root/.claude
+      - evonexus_codex_auth:/root/.codex
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1024M
+      restart_policy:
+        condition: any
+        delay: 10s
+        max_attempts: 0
+      labels:
+        - traefik.enable=false
+
+  # ---------------------------------------------------------------------------
+  # Scheduler (uv run python scheduler.py)
+  # ---------------------------------------------------------------------------
+  evonexus_scheduler:
+    <<: *runtime-base
+    command: ["uv", "run", "python", "scheduler.py"]
+    volumes:
+      - evonexus_config:/workspace/config
+      - evonexus_workspace:/workspace/workspace
+      - evonexus_memory:/workspace/memory
+      - evonexus_adw_logs:/workspace/ADWs/logs
+      - evonexus_agent_memory:/workspace/.claude/agent-memory
+      - evonexus_codex_auth:/root/.codex
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1024M
+      restart_policy:
+        condition: any
+        delay: 10s
+        max_attempts: 0
+      labels:
+        - traefik.enable=false
+
+# ============================================================================
+volumes:
+  evonexus_config:
+  evonexus_workspace:
+  evonexus_dashboard_data:
+  evonexus_memory:
+  evonexus_adw_logs:
+  evonexus_agent_memory:
+  evonexus_claude_auth:
+  evonexus_codex_auth:
+
+networks:
+  marcelonet:
+    external: true
+    name: marcelonet
